@@ -1,1 +1,36 @@
 
+   name: Memo submission
+   description: Request a private repository to submit a memo to the SKAO Memo Series (demo).
+   title: "Submission request"
+   labels: ["submitted"]
+   body:
+     - type: markdown
+       attributes:
+         value: |
+           **This repository is public.** Do not include any content from your memo here.
+           Once an editor approves your request, a private repository will be created
+           for your memo and you will receive an invitation to it.
+     - type: dropdown
+       id: series
+       attributes:
+         label: Series
+         options:
+           - Science Verification
+           - Commissioning
+           - Engineering
+       validations:
+         required: true
+     - type: input
+       id: title
+       attributes:
+         label: Provisional title (optional)
+         description: This will be publicly visible. Leave it empty if you prefer.
+       validations:
+         required: false
+     - type: checkboxes
+       id: confirm
+       attributes:
+         label: Confirmation
+         options:
+           - label: I understand that this repository is public and I have not included any memo content.
+             required: true
