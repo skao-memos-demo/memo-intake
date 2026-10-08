@@ -1,0 +1,179 @@
+# Publishes an accepted memo when an editor adds the "accepted" label to its
+# submission request. Only the files in the memo's publish/ folder are uploaded
+# to Zenodo Sandbox and copied to the public memos repository.
+name: Publish memo
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+  issues: write
+
+# Publish one memo at a time, so two memos never get the same ID
+concurrency:
+  group: publish-memo
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Only runs for the "accepted" label. Only editors (Triage or higher) can add labels.
+    if: github.event.label.name == 'accepted'
+    runs-on: ubuntu-latest
+    env:
+      SUBMISSION_NUMBER: ${{ github.event.issue.number }}
+      ZENODO_API: https://sandbox.zenodo.org/api
+      ZENODO_COMMUNITY: skao-memos-demo
+      PROJECT_NUMBER: 1 # number at the end of the review board URL
+    steps:
+      - name: Get a token for the memo automation app
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.MEMO_APP_ID }}
+          private-key: ${{ secrets.MEMO_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Check out the publication script
+        uses: actions/checkout@v5
+        with:
+          path: intake
+
+      - name: Check out the private memo repository
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/submission-${{ github.event.issue.number }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: memo
+
+      - name: Check out the public memos repository
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/memos
+          token: ${{ steps.app-token.outputs.token }}
+          path: public
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: pip install requests pyyaml
+
+      - name: Get the commit identity of the app
+        id: bot
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          user_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          echo "name=${APP_SLUG}[bot]" >> "$GITHUB_OUTPUT"
+          echo "email=${user_id}+${APP_SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+
+      - name: Publish on Zenodo and copy to the public repository
+        id: publish
+        env:
+          MEMO_DIR: memo
+          PUBLIC_DIR: public
+          PUBLIC_REPO_URL: ${{ github.server_url }}/${{ github.repository_owner }}/memos
+          ZENODO_TOKEN: ${{ secrets.ZENODO_SANDBOX_TOKEN }}
+          GIT_AUTHOR_NAME: ${{ steps.bot.outputs.name }}
+          GIT_AUTHOR_EMAIL: ${{ steps.bot.outputs.email }}
+          GIT_COMMITTER_NAME: ${{ steps.bot.outputs.name }}
+          GIT_COMMITTER_EMAIL: ${{ steps.bot.outputs.email }}
+        run: python intake/.github/scripts/publish_memo.py
+
+      - name: Announce the publication and update the review board
+        uses: actions/github-script@v8
+        env:
+          MEMO_ID: ${{ steps.publish.outputs.memo_id }}
+          MEMO_VERSION: ${{ steps.publish.outputs.version }}
+          MEMO_DOI: ${{ steps.publish.outputs.doi }}
+          RECORD_URL: ${{ steps.publish.outputs.record_url }}
+          PUBLIC_URL: ${{ steps.publish.outputs.public_url }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const org = context.repo.owner;
+            const issueNumber = context.payload.issue.number;
+            const { MEMO_ID, MEMO_VERSION, MEMO_DOI, RECORD_URL, PUBLIC_URL } = process.env;
+
+            // 1. Reply on the submission request and close it
+            const body = [
+              `This memo has been published as **${MEMO_ID}** (version ${MEMO_VERSION}).`,
+              '',
+              `- DOI: ${MEMO_DOI} (Zenodo Sandbox test DOI)`,
+              `- Zenodo record: ${RECORD_URL}`,
+              `- Public copy: ${PUBLIC_URL}`,
+              '',
+              'Thank you for your contribution to the SKAO Memo Series (demo).',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: org, repo: context.repo.repo, issue_number: issueNumber, body,
+            });
+            await github.rest.issues.update({
+              owner: org, repo: context.repo.repo, issue_number: issueNumber,
+              state: 'closed', state_reason: 'completed',
+            });
+
+            // 2. Move the card on the review board to "Published" (a failure here does not stop the workflow)
+            try {
+              const { organization } = await github.graphql(`
+                query($org: String!, $number: Int!) {
+                  organization(login: $org) {
+                    projectV2(number: $number) {
+                      id
+                      field(name: "Status") {
+                        ... on ProjectV2SingleSelectField { id options { id name } }
+                      }
+                    }
+                  }
+                }`, { org, number: Number(process.env.PROJECT_NUMBER) });
+              const project = organization.projectV2;
+              const option = project.field.options.find((o) => o.name === 'Published');
+              if (!option) throw new Error('No "Published" column found on the board.');
+
+              const { repository } = await github.graphql(`
+                query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    issue(number: $number) {
+                      projectItems(first: 20) { nodes { id project { id } } }
+                    }
+                  }
+                }`, { owner: org, repo: context.repo.repo, number: issueNumber });
+              let item = repository.issue.projectItems.nodes.find((n) => n.project.id === project.id);
+              if (!item) {
+                const added = await github.graphql(`
+                  mutation($project: ID!, $content: ID!) {
+                    addProjectV2ItemById(input: { projectId: $project, contentId: $content }) { item { id } }
+                  }`, { project: project.id, content: context.payload.issue.node_id });
+                item = added.addProjectV2ItemById.item;
+              }
+
+              await github.graphql(`
+                mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $project, itemId: $item, fieldId: $field,
+                    value: { singleSelectOptionId: $option }
+                  }) { projectV2Item { id } }
+                }`, { project: project.id, item: item.id, field: project.field.id, option: option.id });
+              core.info('Review board updated: Published');
+            } catch (error) {
+              core.warning(`Could not update the review board: ${error.message}`);
+            }
+
+      - name: Report a failure on the submission request
+        if: failure()
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `The automatic publication of this memo did not complete. An editor should check the workflow log: ${runUrl}`,
+            });
