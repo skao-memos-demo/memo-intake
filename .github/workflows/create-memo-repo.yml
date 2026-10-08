@@ -1,0 +1,170 @@
+# Creates a private repository for a memo when an editor adds the
+# "approved-for-review" label to a submission request in memo-intake.
+name: Create memo repository
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  create-repo:
+    # Only runs for the approval label. Only editors (Triage or higher) can add labels.
+    if: github.event.label.name == 'approved-for-review'
+    runs-on: ubuntu-latest
+    env:
+      TEMPLATE_REPO: memo-template
+      EDITORS_TEAM: editors
+      PROJECT_NUMBER: 1 # number at the end of the review board URL
+    steps:
+      - name: Get a token for the memo automation app
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.MEMO_APP_ID }}
+          private-key: ${{ secrets.MEMO_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Create and configure the private memo repository
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const org = context.repo.owner;
+            const issue = context.payload.issue;
+            const author = issue.user.login;
+            const repoName = `submission-${issue.number}`;
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            // 1. Read the series from the submission request form
+            const match = (issue.body || '').match(/### Series\s+([^\n]+)/);
+            const series = match ? match[1].trim() : 'Unknown';
+
+            // 2. Create the private repository from the template (skip if it already exists)
+            let exists = true;
+            try {
+              await github.rest.repos.get({ owner: org, repo: repoName });
+            } catch (error) {
+              if (error.status === 404) exists = false;
+              else throw error;
+            }
+            if (exists) {
+              core.notice(`${repoName} already exists; skipping creation.`);
+            } else {
+              await github.rest.repos.createUsingTemplate({
+                template_owner: org,
+                template_repo: process.env.TEMPLATE_REPO,
+                owner: org,
+                name: repoName,
+                description: `Memo submission #${issue.number} (demo)`,
+                private: true,
+              });
+              core.info(`Created ${org}/${repoName}`);
+            }
+
+            // 3. Fill in series and submission_request in memo.yaml
+            //    (the template contents can take a few seconds to appear)
+            let file;
+            for (let attempt = 1; attempt <= 10 && !file; attempt++) {
+              try {
+                ({ data: file } = await github.rest.repos.getContent({
+                  owner: org, repo: repoName, path: 'memo.yaml',
+                }));
+              } catch (error) {
+                if (![404, 409].includes(error.status)) throw error;
+                await sleep(3000);
+              }
+            }
+            if (!file) throw new Error('memo.yaml was not found in the new repository.');
+            const original = Buffer.from(file.content, 'base64').toString('utf8');
+            const updated = original
+              .replace(/^series: null/m, `series: "${series}"`)
+              .replace(/^submission_request: null/m, `submission_request: ${issue.number}`);
+            if (updated !== original) {
+              await github.rest.repos.createOrUpdateFileContents({
+                owner: org,
+                repo: repoName,
+                path: 'memo.yaml',
+                message: `Set series and submission request #${issue.number}`,
+                content: Buffer.from(updated, 'utf8').toString('base64'),
+                sha: file.sha,
+              });
+            }
+
+            // 4. Give the editors team access to the new repository
+            await github.rest.teams.addOrUpdateRepoPermissionsInOrg({
+              org,
+              team_slug: process.env.EDITORS_TEAM,
+              owner: org,
+              repo: repoName,
+              permission: 'maintain',
+            });
+
+            // 5. Invite the author, unless they already have access (e.g. an organisation owner)
+            let invited = false;
+            try {
+              await github.rest.repos.checkCollaborator({ owner: org, repo: repoName, username: author });
+              core.info(`${author} already has access; no invitation needed.`);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.repos.addCollaborator({
+                owner: org, repo: repoName, username: author, permission: 'push',
+              });
+              invited = true;
+            }
+
+            // 6. Reply to the author on the submission request
+            const body = invited
+              ? 'Thank you for your submission request. A private repository has been created for your memo, and you will receive an invitation to it by email. Please accept the invitation and follow the instructions in its README. All further work, including the review, will take place there.'
+              : 'Thank you for your submission request. A private repository has been created for your memo, and you already have access to it. Please follow the instructions in its README. All further work, including the review, will take place there.';
+            await github.rest.issues.createComment({
+              owner: org, repo: context.repo.repo, issue_number: issue.number, body,
+            });
+
+            // 7. Move the card on the review board to "Under review" (a failure here does not stop the workflow)
+            try {
+              const { organization } = await github.graphql(`
+                query($org: String!, $number: Int!) {
+                  organization(login: $org) {
+                    projectV2(number: $number) {
+                      id
+                      field(name: "Status") {
+                        ... on ProjectV2SingleSelectField { id options { id name } }
+                      }
+                    }
+                  }
+                }`, { org, number: Number(process.env.PROJECT_NUMBER) });
+              const project = organization.projectV2;
+              const option = project.field.options.find((o) => o.name === 'Under review');
+              if (!option) throw new Error('No "Under review" column found on the board.');
+
+              const { repository } = await github.graphql(`
+                query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    issue(number: $number) {
+                      projectItems(first: 20) { nodes { id project { id } } }
+                    }
+                  }
+                }`, { owner: org, repo: context.repo.repo, number: issue.number });
+              let item = repository.issue.projectItems.nodes.find((n) => n.project.id === project.id);
+              if (!item) {
+                const added = await github.graphql(`
+                  mutation($project: ID!, $content: ID!) {
+                    addProjectV2ItemById(input: { projectId: $project, contentId: $content }) { item { id } }
+                  }`, { project: project.id, content: issue.node_id });
+                item = added.addProjectV2ItemById.item;
+              }
+
+              await github.graphql(`
+                mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $project, itemId: $item, fieldId: $field,
+                    value: { singleSelectOptionId: $option }
+                  }) { projectV2Item { id } }
+                }`, { project: project.id, item: item.id, field: project.field.id, option: option.id });
+              core.info('Review board updated: Under review');
+            } catch (error) {
+              core.warning(`Could not update the review board: ${error.message}`);
+            }
